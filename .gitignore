@@ -1,0 +1,4 @@
+ble_attendance.db*
+__pycache__/
+*.pyc
+.venv/
