@@ -1,0 +1,42 @@
+{
+  "model_version": "pilot-v1",
+  "window_seconds": 5,
+  "feature_names": [
+    "sample_count",
+    "has_signal",
+    "last_seen_gap_s",
+    "consecutive_empty_windows",
+    "sample_count_15s",
+    "sample_count_30s",
+    "sample_count_ratio",
+    "mean_rssi",
+    "std_rssi",
+    "rssi_slope",
+    "rssi_drop_from_baseline"
+  ],
+  "classes": [
+    "ABSENT",
+    "PRESENT"
+  ],
+  "training_rows": 900,
+  "training_runs": [
+    "far_1",
+    "far_2",
+    "far_shield_2",
+    "leave_1",
+    "leave_2",
+    "leave_3",
+    "near_1",
+    "near_2",
+    "shield_1"
+  ],
+  "class_counts": {
+    "PRESENT": 468,
+    "ABSENT": 432
+  },
+  "source_csv_sha256": "9cb6b9bc0aaf41f05e0039efb3d989d3e7eff0748b653e7252921498ba02b534",
+  "trained_at_utc": "2026-09-25T19:28:29.381625+00:00",
+  "python_version": "3.14.5",
+  "scikit_learn_version": "1.9.1",
+  "note": "Pilot headset model; all available runs used for fitting. Do not interpret training accuracy as held-out performance."
+}
