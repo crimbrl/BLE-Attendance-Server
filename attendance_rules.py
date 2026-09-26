@@ -5,7 +5,7 @@ STARTUP_WINDOWS = 6  # Initial 30 s is a calibration period, not an absence aler
 RULE_VERSION = "absence-120-present-3-v2"
 
 
-def derive_events(rows):
+def derive_events(rows, include_candidate=False):
     """Yield (window_index, event_type) for prolonged absence and return.
 
     Count ABSENT windows during a candidate departure. One or two PRESENT
@@ -16,6 +16,7 @@ def derive_events(rows):
     state = "UNKNOWN"
     previous_index = -1
     valid_streak = present_streak = absent_windows = 0
+    candidate_index = None
     events = []
 
     for row in rows:
@@ -24,10 +25,12 @@ def derive_events(rows):
             raise ValueError("Window indexes must increase")
         if index != previous_index + 1:
             valid_streak = present_streak = absent_windows = 0
+            candidate_index = None
         previous_index = index
         prediction = row["predicted_state"]
         if row["scan_state"] != "RUNNING" or prediction not in ("PRESENT", "ABSENT"):
             valid_streak = present_streak = absent_windows = 0
+            candidate_index = None
             continue
 
         valid_streak += 1
@@ -35,9 +38,12 @@ def derive_events(rows):
             present_streak += 1
             if present_streak >= PRESENT_STREAK:
                 absent_windows = 0
+                candidate_index = None
         else:
             present_streak = 0
             if state == "PRESENT":
+                if candidate_index is None:
+                    candidate_index = index
                 absent_windows += 1
 
         if state == "UNKNOWN":
@@ -46,9 +52,13 @@ def derive_events(rows):
         elif state == "PRESENT" and absent_windows >= ABSENT_WINDOWS_FOR_ALERT:
             state = "ABSENT"
             absent_windows = 0
+            candidate_index = None
             events.append((index, "LEFT"))
         elif state == "ABSENT" and present_streak >= PRESENT_STREAK:
             state = "PRESENT"
             absent_windows = 0
+            candidate_index = None
             events.append((index, "RETURNED"))
+    if include_candidate:
+        return events, candidate_index
     return events

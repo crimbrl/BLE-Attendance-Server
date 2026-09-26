@@ -2,7 +2,11 @@
 import os
 import sqlite3
 import json
+import asyncio
+import logging
+import time
 from contextlib import contextmanager
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
 from uuid import UUID
@@ -14,12 +18,46 @@ import pandas as pd
 import sklearn
 
 from features import FEATURES, build_feature_rows
-from attendance_rules import RULE_VERSION, derive_events
+from attendance_rules import RULE_VERSION, PRESENT_STREAK, derive_events
 
 WINDOW_NS = 5_000_000_000
+WINDOW_MS = 5000
+NO_DATA_TIMEOUT_MS = 10 * 60 * 1000
+LIVE_WINDOW_TOLERANCE_MS = 30 * 1000
+MONITOR_DURATION_MS = int(os.environ.get("BLE_CLASS_DURATION_MINUTES", "90")) * 60 * 1000
+if MONITOR_DURATION_MS <= NO_DATA_TIMEOUT_MS:
+    raise ValueError("BLE_CLASS_DURATION_MINUTES must exceed 10")
 DB_PATH = Path(os.environ.get("BLE_DB_PATH", "ble_attendance.db"))
-app = FastAPI(title="BLE Attendance Pilot", version="0.1")
 MODEL_DIR = Path(__file__).resolve().parent / "model"
+logger = logging.getLogger(__name__)
+
+
+def now_epoch_ms():
+    return int(time.time() * 1000)
+
+
+@asynccontextmanager
+async def lifespan(app):
+    async def monitor():
+        while True:
+            try:
+                await asyncio.to_thread(check_no_data)
+            except Exception:
+                logger.exception("Server-side collection monitor failed")
+            await asyncio.sleep(5)
+
+    task = asyncio.create_task(monitor())
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+app = FastAPI(title="BLE Attendance Pilot", version="0.1", lifespan=lifespan)
 
 
 def load_prediction_model():
@@ -127,6 +165,20 @@ def init_db():
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(session_id, beacon_id, window_index, event_type, rule_version)
             );
+            CREATE TABLE IF NOT EXISTS no_data_alerts (
+                alert_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL REFERENCES sessions(session_id),
+                class_id TEXT NOT NULL,
+                beacon_id TEXT NOT NULL,
+                missing_since_epoch_ms INTEGER NOT NULL,
+                suspected_since_epoch_ms INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                triggered_at_epoch_ms INTEGER NOT NULL,
+                resolved_at_epoch_ms INTEGER,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS one_open_no_data_alert
+                ON no_data_alerts(session_id) WHERE resolved_at_epoch_ms IS NULL;
         """)
         existing = {row["name"] for row in con.execute("PRAGMA table_info(windows)")}
         for name, sql_type in (
@@ -138,6 +190,12 @@ def init_db():
         ):
             if name not in existing:
                 con.execute(f"ALTER TABLE windows ADD COLUMN {name} {sql_type}")
+        existing_sessions = {row["name"] for row in con.execute("PRAGMA table_info(sessions)")}
+        for name in ("monitor_started_epoch_ms", "last_live_epoch_ms",
+                     "monitor_until_epoch_ms", "last_live_window_index",
+                     "fresh_present_streak"):
+            if name not in existing_sessions:
+                con.execute(f"ALTER TABLE sessions ADD COLUMN {name} INTEGER")
 
 
 init_db()
@@ -202,6 +260,85 @@ def refresh_attendance_events(con, session):
              index, kind, end_epoch_ms, RULE_VERSION))
 
 
+def record_live_windows(con, session, accepted_indexes, received_ms):
+    """Only recent, newly accepted predictions advance server-observed liveness."""
+    previous_index = session["last_live_window_index"]
+    present_streak = session["fresh_present_streak"] or 0
+    last_live_ms = session["last_live_epoch_ms"]
+    for index in sorted(accepted_indexes):
+        window_end_ms = session["start_epoch_ms"] + (index + 1) * WINDOW_MS
+        if abs(received_ms - window_end_ms) > LIVE_WINDOW_TOLERANCE_MS:
+            continue  # Replayed/offline Window: useful history, not proof of current state.
+        row = con.execute("""SELECT scan_state, predicted_state FROM windows
+            WHERE session_id=? AND beacon_id=? AND window_index=?""",
+            (session["session_id"], session["beacon_id"], index)).fetchone()
+        if row["scan_state"] != "RUNNING" or row["predicted_state"] not in ("PRESENT", "ABSENT"):
+            continue
+        if previous_index is not None and index <= previous_index:
+            continue
+        if row["predicted_state"] == "PRESENT":
+            present_streak = present_streak + 1 if previous_index == index - 1 else 1
+        else:
+            present_streak = 0
+        previous_index = index
+        last_live_ms = received_ms
+        if present_streak >= PRESENT_STREAK:
+            con.execute("""UPDATE no_data_alerts SET resolved_at_epoch_ms=?
+                WHERE session_id=? AND resolved_at_epoch_ms IS NULL""",
+                (received_ms, session["session_id"]))
+    con.execute("""UPDATE sessions SET last_live_epoch_ms=?, last_live_window_index=?,
+        fresh_present_streak=? WHERE session_id=?""",
+        (last_live_ms, previous_index, present_streak, session["session_id"]))
+
+
+def check_no_data(now_ms=None):
+    """Run on a server timer; no phone POST is required to detect silence."""
+    now_ms = now_epoch_ms() if now_ms is None else now_ms
+    with database() as con:
+        con.execute("BEGIN IMMEDIATE")  # Serialize workers sharing this SQLite file.
+        sessions = con.execute("""SELECT * FROM sessions
+            WHERE monitor_started_epoch_ms IS NOT NULL
+              AND monitor_until_epoch_ms > ?""", (now_ms,)).fetchall()
+        for session in sessions:
+            last_live = (session["last_live_epoch_ms"] if session["last_live_epoch_ms"] is not None
+                         else session["monitor_started_epoch_ms"])
+            if con.execute("""SELECT 1 FROM no_data_alerts WHERE session_id=?
+                AND resolved_at_epoch_ms IS NULL""", (session["session_id"],)).fetchone():
+                continue
+            latest_event = con.execute("""SELECT event_type FROM attendance_events
+                WHERE session_id=? AND beacon_id=? AND active=1
+                ORDER BY window_index DESC, event_id DESC LIMIT 1""",
+                (session["session_id"], session["beacon_id"])).fetchone()
+            if latest_event and latest_event["event_type"] == "LEFT":
+                continue  # The professor already has a BLE departure event.
+
+            deadline = last_live + NO_DATA_TIMEOUT_MS
+            suspected_since = last_live
+            reason = "NO_DATA"
+            last_index = session["last_live_window_index"]
+            if last_index is not None:
+                rows = con.execute("""SELECT window_index, scan_state, predicted_state
+                    FROM windows WHERE session_id=? AND beacon_id=? AND window_index<=?
+                    ORDER BY window_index""",
+                    (session["session_id"], session["beacon_id"], last_index)).fetchall()
+                _, candidate = derive_events(rows, include_candidate=True)
+                if candidate is not None:
+                    candidate_start = max(session["monitor_started_epoch_ms"],
+                                          last_live - (last_index - candidate) * WINDOW_MS)
+                    if candidate_start < last_live:
+                        suspected_since = candidate_start
+                        reason = "ABSENCE_AND_NO_DATA"
+                        deadline = candidate_start + NO_DATA_TIMEOUT_MS
+            if now_ms < deadline:
+                continue
+            con.execute("""INSERT OR IGNORE INTO no_data_alerts
+                (session_id, class_id, beacon_id, missing_since_epoch_ms,
+                 suspected_since_epoch_ms, reason, triggered_at_epoch_ms)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (session["session_id"], session["class_id"], session["beacon_id"],
+                 last_live, suspected_since, reason, now_ms))
+
+
 def backfill_stored_windows():
     """Predict rows saved before this server version, preserving raw data."""
     with database() as con:
@@ -227,6 +364,7 @@ def health():
 @app.post("/v1/collection-sessions", status_code=201)
 def create_session(payload: SessionStart):
     session_id = str(payload.session_id)
+    created_ms = now_epoch_ms()
     incoming = (
         payload.class_id, payload.beacon_id,
         payload.start_epoch_ms, payload.start_elapsed_ns,
@@ -240,8 +378,10 @@ def create_session(payload: SessionStart):
                 raise HTTPException(409, "session_id already has different metadata")
             return {"session_id": session_id, "already_exists": True}
         con.execute("""INSERT INTO sessions
-            (session_id, class_id, beacon_id, start_epoch_ms, start_elapsed_ns)
-            VALUES (?, ?, ?, ?, ?)""", (session_id, *incoming))
+            (session_id, class_id, beacon_id, start_epoch_ms, start_elapsed_ns,
+             monitor_started_epoch_ms, monitor_until_epoch_ms)
+            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (session_id, *incoming, created_ms, created_ms + MONITOR_DURATION_MS))
     return {"session_id": session_id, "already_exists": False}
 
 
@@ -249,6 +389,7 @@ def create_session(payload: SessionStart):
 def receive_windows(payload: WindowBatch):
     session_id = str(payload.session_id)
     accepted = duplicates = 0
+    accepted_indexes = []
     with database() as con:
         session = con.execute(
             "SELECT * FROM sessions WHERE session_id=?", (session_id,)
@@ -286,10 +427,12 @@ def receive_windows(payload: WindowBatch):
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (session_id, payload.beacon_id, window.window_index, *values))
             accepted += 1
+            accepted_indexes.append(window.window_index)
         if accepted:
             refresh_predictions(con, session_id, payload.beacon_id,
                                 session["start_elapsed_ns"])
             refresh_attendance_events(con, session)
+            record_live_windows(con, session, accepted_indexes, now_epoch_ms())
         requested = sorted({w.window_index for w in payload.windows})
         marks = ",".join("?" for _ in requested)
         predictions = [dict(row) for row in con.execute(f"""
@@ -310,11 +453,40 @@ def receive_windows(payload: WindowBatch):
 def list_class_alerts(class_id: str):
     """Demo dashboard feed. Add professor authentication before deployment."""
     with database() as con:
-        rows = con.execute("""SELECT event_id, session_id, beacon_id,
+        rows = con.execute("""SELECT event_id, session_id, beacon_id, window_index,
             event_type, event_time_epoch_ms, rule_version, created_at
             FROM attendance_events WHERE class_id=? AND active=1
             ORDER BY event_id DESC LIMIT 100""", (class_id,)).fetchall()
-        return {"class_id": class_id, "alerts": [dict(row) for row in rows]}
+        alerts = []
+        open_no_data = {row[0] for row in con.execute("""SELECT session_id FROM no_data_alerts
+            WHERE class_id=? AND resolved_at_epoch_ms IS NULL""", (class_id,))}
+        for row in rows:
+            event = dict(row)
+            event["alert_key"] = f"ble:{event['event_id']}"
+            event["source"] = "BLE"
+            returned = con.execute("""SELECT 1 FROM attendance_events
+                WHERE session_id=? AND active=1 AND event_type='RETURNED'
+                AND window_index>? LIMIT 1""",
+                (event["session_id"], event["window_index"])).fetchone()
+            event["status"] = "RESOLVED" if event["event_type"] == "RETURNED" or returned else "OPEN"
+            if (event["event_type"] == "LEFT" and event["status"] == "OPEN"
+                    and event["session_id"] in open_no_data):
+                continue  # The same episode already has an open server-side alert.
+            alerts.append(event)
+        for row in con.execute("""SELECT alert_id AS event_id, session_id, beacon_id,
+            missing_since_epoch_ms, suspected_since_epoch_ms, reason,
+            triggered_at_epoch_ms AS event_time_epoch_ms,
+            resolved_at_epoch_ms, created_at FROM no_data_alerts
+            WHERE class_id=? ORDER BY alert_id DESC LIMIT 100""", (class_id,)):
+            alert = dict(row)
+            alert["alert_key"] = f"no_data:{alert['event_id']}"
+            alert["event_type"] = "NO_DATA"
+            alert["rule_version"] = "no-data-10m-v1"
+            alert["source"] = "SERVER"
+            alert["status"] = "RESOLVED" if alert["resolved_at_epoch_ms"] is not None else "OPEN"
+            alerts.append(alert)
+        alerts.sort(key=lambda row: row["event_time_epoch_ms"], reverse=True)
+        return {"class_id": class_id, "alerts": alerts[:100]}
 
 
 @app.get("/v1/collection-sessions/{session_id}/windows")
