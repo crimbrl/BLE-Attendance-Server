@@ -2,3 +2,5 @@ ble_attendance.db*
 __pycache__/
 *.pyc
 .venv/
+.teacher-token
+.pytest_cache/

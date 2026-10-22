@@ -11,7 +11,10 @@ from pathlib import Path
 from typing import Literal
 from uuid import UUID
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi.responses import FileResponse
+import secrets
+import hmac
 from pydantic import BaseModel, Field, model_validator
 import joblib
 import pandas as pd
@@ -28,7 +31,7 @@ MONITOR_DURATION_MS = int(os.environ.get("BLE_CLASS_DURATION_MINUTES", "90")) * 
 if MONITOR_DURATION_MS <= NO_DATA_TIMEOUT_MS:
     raise ValueError("BLE_CLASS_DURATION_MINUTES must exceed 10")
 DB_PATH = Path(os.environ.get("BLE_DB_PATH", "ble_attendance.db"))
-MODEL_DIR = Path(__file__).resolve().parent / "model"
+MODEL_DIR = Path(os.environ.get("BLE_MODEL_DIR", str(Path(__file__).resolve().parent / "model")))
 logger = logging.getLogger(__name__)
 
 
@@ -76,6 +79,8 @@ class SessionStart(BaseModel):
     protocol_version: Literal[1]
     session_id: UUID
     class_id: str = Field(min_length=1, max_length=100)
+    student_id: str | None = Field(default=None, min_length=1, max_length=100)
+    student_name: str | None = Field(default=None, min_length=1, max_length=100)
     beacon_id: str = Field(min_length=1, max_length=100)
     start_epoch_ms: int = Field(ge=0)
     start_elapsed_ns: int = Field(ge=0)
@@ -132,6 +137,16 @@ def init_db():
     with database() as con:
         con.execute("PRAGMA journal_mode=WAL")
         con.executescript("""
+            CREATE TABLE IF NOT EXISTS classes (
+                class_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'READY',
+                duration_minutes INTEGER NOT NULL,
+                created_epoch_ms INTEGER NOT NULL,
+                started_epoch_ms INTEGER,
+                ends_epoch_ms INTEGER,
+                ended_epoch_ms INTEGER
+            );
             CREATE TABLE IF NOT EXISTS sessions (
                 session_id TEXT PRIMARY KEY,
                 class_id TEXT NOT NULL,
@@ -196,6 +211,11 @@ def init_db():
                      "fresh_present_streak"):
             if name not in existing_sessions:
                 con.execute(f"ALTER TABLE sessions ADD COLUMN {name} INTEGER")
+
+        for name, sql_type in (("student_id", "TEXT"), ("student_name", "TEXT"),
+                               ("closed_epoch_ms", "INTEGER"), ("close_reason", "TEXT")):
+            if name not in existing_sessions:
+                con.execute(f"ALTER TABLE sessions ADD COLUMN {name} {sql_type}")
 
 
 init_db()
@@ -294,6 +314,7 @@ def record_live_windows(con, session, accepted_indexes, received_ms):
 def check_no_data(now_ms=None):
     """Run on a server timer; no phone POST is required to detect silence."""
     now_ms = now_epoch_ms() if now_ms is None else now_ms
+    expire_classes(now_ms)
     with database() as con:
         con.execute("BEGIN IMMEDIATE")  # Serialize workers sharing this SQLite file.
         sessions = con.execute("""SELECT * FROM sessions
@@ -356,6 +377,150 @@ def backfill_stored_windows():
 backfill_stored_windows()
 
 
+TOKEN_PATH = Path(__file__).resolve().parent / ".teacher-token"
+if os.environ.get("BLE_TEACHER_TOKEN"):
+    TEACHER_TOKEN = os.environ["BLE_TEACHER_TOKEN"]
+else:
+    try:
+        with TOKEN_PATH.open("x", encoding="utf-8") as token_file:
+            token_file.write(secrets.token_urlsafe(24))
+        TOKEN_PATH.chmod(0o600)
+    except FileExistsError:
+        pass
+    TEACHER_TOKEN = TOKEN_PATH.read_text(encoding="utf-8").strip()
+if not TEACHER_TOKEN:
+    raise RuntimeError("Teacher token must not be empty")
+
+
+def require_teacher(x_teacher_token: str = Header(default="")):
+    if not hmac.compare_digest(x_teacher_token, TEACHER_TOKEN):
+        raise HTTPException(401, "교수자 키를 확인하세요")
+
+
+def close_session(con, session_id, when, reason):
+    con.execute("""UPDATE sessions SET closed_epoch_ms=?, close_reason=?,
+        monitor_until_epoch_ms=MIN(monitor_until_epoch_ms, ?) WHERE session_id=?
+        AND closed_epoch_ms IS NULL""", (when, reason, when, session_id))
+    con.execute("""UPDATE no_data_alerts SET resolved_at_epoch_ms=?
+        WHERE session_id=? AND resolved_at_epoch_ms IS NULL""", (when, session_id))
+
+
+def end_class(con, class_id, when):
+    con.execute("UPDATE classes SET status='ENDED', ended_epoch_ms=? WHERE class_id=?", (when, class_id))
+    for row in con.execute("SELECT session_id FROM sessions WHERE class_id=?", (class_id,)).fetchall():
+        close_session(con, row['session_id'], when, 'CLASS_ENDED')
+
+
+def expire_classes(now_ms=None):
+    now_ms = now_epoch_ms() if now_ms is None else now_ms
+    with database() as con:
+        con.execute("BEGIN IMMEDIATE")
+        for lecture in con.execute("SELECT * FROM classes WHERE status='ACTIVE' AND ends_epoch_ms<=?", (now_ms,)).fetchall():
+            end_class(con, lecture['class_id'], lecture['ends_epoch_ms'])
+
+
+class ClassCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=100)
+    duration_minutes: int = Field(default=90, ge=15, le=360)
+
+
+@app.get("/", include_in_schema=False)
+def teacher_page():
+    return FileResponse(Path(__file__).resolve().parent / 'teacher.html')
+
+
+@app.post("/v1/teacher/classes", dependencies=[Depends(require_teacher)], status_code=201)
+def create_class(payload: ClassCreate):
+    if not payload.title.strip():
+        raise HTTPException(422, "수업 이름이 필요합니다")
+    code = secrets.token_hex(4).upper()
+    with database() as con:
+        con.execute("INSERT INTO classes(class_id,title,duration_minutes,created_epoch_ms) VALUES (?,?,?,?)",
+                    (code, payload.title.strip(), payload.duration_minutes, now_epoch_ms()))
+    return {"class_id": code}
+
+
+@app.get("/v1/teacher/classes", dependencies=[Depends(require_teacher)])
+def list_classes():
+    expire_classes()
+    with database() as con:
+        return {"classes": [dict(r) for r in con.execute("SELECT * FROM classes ORDER BY created_epoch_ms DESC LIMIT 100")]}
+
+
+@app.post("/v1/teacher/classes/{class_id}/start", dependencies=[Depends(require_teacher)])
+def start_class(class_id: str):
+    with database() as con:
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute("SELECT * FROM classes WHERE class_id=?", (class_id,)).fetchone()
+        if not row: raise HTTPException(404, "수업을 찾을 수 없습니다")
+        if row['status'] == 'ENDED': raise HTTPException(409, "새 수업을 생성하세요")
+        if row['status'] == 'READY':
+            now = now_epoch_ms()
+            con.execute("UPDATE classes SET status='ACTIVE',started_epoch_ms=?,ends_epoch_ms=? WHERE class_id=?",
+                        (now, now + row['duration_minutes'] * 60000, class_id))
+    return {"status": "ACTIVE"}
+
+
+@app.post("/v1/teacher/classes/{class_id}/end", dependencies=[Depends(require_teacher)])
+def finish_class(class_id: str):
+    with database() as con:
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute("SELECT * FROM classes WHERE class_id=?", (class_id,)).fetchone()
+        if not row: raise HTTPException(404, "수업을 찾을 수 없습니다")
+        if row['status'] != 'ENDED': end_class(con, class_id, now_epoch_ms())
+    return {"status": "ENDED"}
+
+
+@app.get("/v1/classes/{class_id}/status")
+def class_status(class_id: str):
+    expire_classes()
+    with database() as con:
+        row = con.execute("SELECT * FROM classes WHERE class_id=?", (class_id,)).fetchone()
+        if not row: raise HTTPException(404, "수업 코드를 확인하세요")
+        return dict(row)
+
+
+@app.get("/v1/teacher/classes/{class_id}/overview", dependencies=[Depends(require_teacher)])
+def class_overview(class_id: str):
+    lecture = class_status(class_id)
+    now = now_epoch_ms()
+    with database() as con:
+        sessions = con.execute("""SELECT * FROM sessions WHERE class_id=?
+            ORDER BY start_epoch_ms DESC, session_id DESC""", (class_id,)).fetchall()
+        students, seen = [], set()
+        for session in sessions:
+            key = session['student_id'] or session['session_id']
+            if key in seen: continue
+            seen.add(key)
+            latest = con.execute("SELECT * FROM windows WHERE session_id=? ORDER BY window_index DESC LIMIT 1", (session['session_id'],)).fetchone()
+            rows = con.execute("SELECT * FROM windows WHERE session_id=? ORDER BY window_index", (session['session_id'],)).fetchall()
+            events, candidate = derive_events(rows, include_candidate=True)
+            open_alert = con.execute("SELECT 1 FROM no_data_alerts WHERE session_id=? AND resolved_at_epoch_ms IS NULL", (session['session_id'],)).fetchone()
+            state = 'INITIALIZING'
+            if events and events[-1][1] == 'LEFT': state = 'LEFT'
+            elif candidate is not None: state = 'ABSENCE_CANDIDATE'
+            elif latest and latest['predicted_state'] == 'PRESENT' and (session['fresh_present_streak'] or 0) >= 3 and len(rows) >= 6: state = 'PRESENT'
+            if latest and latest['scan_state'] == 'INTERRUPTED': state = 'INTERRUPTED'
+            last_live = session['last_live_epoch_ms']
+            if now - (last_live or session['monitor_started_epoch_ms']) > LIVE_WINDOW_TOLERANCE_MS:
+                state = 'STALE'
+            if open_alert: state = 'NO_DATA'
+            if lecture['status'] == 'ENDED': state = 'ENDED'
+            students.append({"student_id": key, "student_name": session['student_name'] or '기존 실험 세션',
+                "session_id": session['session_id'], "state": state, "last_live_epoch_ms": last_live,
+                "latest_prediction": latest['predicted_state'] if latest else None,
+                "window_count": len(rows), "mean_rssi_dbm": latest['mean_rssi_dbm'] if latest else None})
+        history = {r['session_id']: r for r in sessions}
+    alerts = list_class_alerts(class_id)['alerts']
+    for alert in alerts:
+        session = history.get(alert['session_id'])
+        alert['student_id'] = session['student_id'] if session else None
+        alert['student_name'] = session['student_name'] if session else None
+        if session and session['closed_epoch_ms'] and alert['status'] == 'OPEN':
+            alert['status'] = 'CLOSED'
+    return {"class": lecture, "students": students, "alerts": alerts, "server_epoch_ms": now}
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -363,34 +528,65 @@ def health():
 
 @app.post("/v1/collection-sessions", status_code=201)
 def create_session(payload: SessionStart):
+    expire_classes()
     session_id = str(payload.session_id)
     created_ms = now_epoch_ms()
-    incoming = (
-        payload.class_id, payload.beacon_id,
-        payload.start_epoch_ms, payload.start_elapsed_ns,
-    )
+    incoming = (payload.class_id, payload.beacon_id, payload.start_epoch_ms,
+                payload.start_elapsed_ns, payload.student_id, payload.student_name)
     with database() as con:
+        con.execute("BEGIN IMMEDIATE")
         row = con.execute("SELECT * FROM sessions WHERE session_id=?", (session_id,)).fetchone()
         if row:
             existing = tuple(row[field] for field in
-                             ("class_id", "beacon_id", "start_epoch_ms", "start_elapsed_ns"))
+                ("class_id", "beacon_id", "start_epoch_ms", "start_elapsed_ns", "student_id", "student_name"))
             if existing != incoming:
                 raise HTTPException(409, "session_id already has different metadata")
             return {"session_id": session_id, "already_exists": True}
+        lecture = con.execute("SELECT * FROM classes WHERE class_id=?", (payload.class_id,)).fetchone()
+        # Keep the original pilot protocol working only for unmanaged, anonymous sessions.
+        if payload.student_id is not None and lecture is None:
+            raise HTTPException(404, "수업 코드를 확인하세요")
+        if lecture is not None:
+            if not payload.student_id or not payload.student_id.strip() or not payload.student_name or not payload.student_name.strip():
+                raise HTTPException(422, "학생 ID와 이름이 필요합니다")
+            if lecture['started_epoch_ms'] is None:
+                raise HTTPException(409, "아직 시작하지 않은 수업입니다")
+            if payload.start_epoch_ms < lecture['started_epoch_ms'] - 30000:
+                raise HTTPException(409, "수업 시작 이전의 세션입니다")
+            if payload.start_epoch_ms > created_ms + 30000:
+                raise HTTPException(422, "휴대폰 시각을 확인하세요")
+            if lecture['ended_epoch_ms'] and payload.start_epoch_ms >= lecture['ended_epoch_ms']:
+                raise HTTPException(409, "종료된 수업입니다")
+        deadline = lecture['ends_epoch_ms'] if lecture else created_ms + MONITOR_DURATION_MS
+        closed_at = lecture['ended_epoch_ms'] if lecture else None
+        close_reason = 'CLASS_ENDED' if closed_at else None
+        if lecture:
+            newer = con.execute("""SELECT 1 FROM sessions WHERE class_id=? AND student_id=?
+                AND start_epoch_ms>=?""", (payload.class_id, payload.student_id, payload.start_epoch_ms)).fetchone()
+            if newer and closed_at is None:
+                closed_at, close_reason = created_ms, 'SUPERSEDED'
+            if not newer:
+                old = con.execute("""SELECT session_id FROM sessions WHERE class_id=? AND student_id=?
+                    AND closed_epoch_ms IS NULL""", (payload.class_id, payload.student_id)).fetchall()
+                for previous in old:
+                    close_session(con, previous['session_id'], created_ms, 'SUPERSEDED')
         con.execute("""INSERT INTO sessions
-            (session_id, class_id, beacon_id, start_epoch_ms, start_elapsed_ns,
-             monitor_started_epoch_ms, monitor_until_epoch_ms)
-            VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (session_id, *incoming, created_ms, created_ms + MONITOR_DURATION_MS))
+            (session_id, class_id, beacon_id, start_epoch_ms, start_elapsed_ns, student_id, student_name,
+             monitor_started_epoch_ms, monitor_until_epoch_ms, closed_epoch_ms, close_reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (session_id, *incoming, created_ms, min(deadline, closed_at) if closed_at else deadline,
+             closed_at, close_reason))
     return {"session_id": session_id, "already_exists": False}
 
 
 @app.post("/v1/ble-windows:batch")
 def receive_windows(payload: WindowBatch):
+    expire_classes()
     session_id = str(payload.session_id)
-    accepted = duplicates = 0
+    accepted = duplicates = ignored = 0
     accepted_indexes = []
     with database() as con:
+        con.execute("BEGIN IMMEDIATE")
         session = con.execute(
             "SELECT * FROM sessions WHERE session_id=?", (session_id,)
         ).fetchone()
@@ -400,6 +596,12 @@ def receive_windows(payload: WindowBatch):
             raise HTTPException(409, "beacon_id does not match session")
 
         for window in payload.windows:
+            window_end = session['start_epoch_ms'] + (window.window_index + 1) * WINDOW_MS
+            if session['closed_epoch_ms'] is not None and window_end > session['closed_epoch_ms']:
+                ignored += 1
+                continue
+            if window_end > now_epoch_ms() + LIVE_WINDOW_TOLERANCE_MS:
+                raise HTTPException(422, "window is in the future")
             start = session["start_elapsed_ns"] + window.window_index * WINDOW_NS
             end = start + WINDOW_NS
             if window.last_packet_elapsed_ns is not None and not (
@@ -432,7 +634,8 @@ def receive_windows(payload: WindowBatch):
             refresh_predictions(con, session_id, payload.beacon_id,
                                 session["start_elapsed_ns"])
             refresh_attendance_events(con, session)
-            record_live_windows(con, session, accepted_indexes, now_epoch_ms())
+            if session["closed_epoch_ms"] is None:
+                record_live_windows(con, session, accepted_indexes, now_epoch_ms())
         requested = sorted({w.window_index for w in payload.windows})
         marks = ",".join("?" for _ in requested)
         predictions = [dict(row) for row in con.execute(f"""
@@ -446,10 +649,12 @@ def receive_windows(payload: WindowBatch):
             AND window_index IN ({marks}) ORDER BY window_index""",
             (session_id, payload.beacon_id, *requested)).fetchall()]
     return {"session_id": session_id, "accepted": accepted,
-            "duplicates": duplicates, "predictions": predictions, "events": events}
+            "duplicates": duplicates, "ignored_after_close": ignored,
+            "session_closed": session["closed_epoch_ms"] is not None,
+            "close_reason": session["close_reason"], "predictions": predictions, "events": events}
 
 
-@app.get("/v1/classes/{class_id}/alerts")
+@app.get("/v1/classes/{class_id}/alerts", dependencies=[Depends(require_teacher)])
 def list_class_alerts(class_id: str):
     """Demo dashboard feed. Add professor authentication before deployment."""
     with database() as con:
@@ -489,7 +694,7 @@ def list_class_alerts(class_id: str):
         return {"class_id": class_id, "alerts": alerts[:100]}
 
 
-@app.get("/v1/collection-sessions/{session_id}/windows")
+@app.get("/v1/collection-sessions/{session_id}/windows", dependencies=[Depends(require_teacher)])
 def list_windows(session_id: UUID):
     with database() as con:
         session = con.execute(
@@ -500,6 +705,6 @@ def list_windows(session_id: UUID):
         rows = con.execute("""SELECT beacon_id, window_index, scan_state, sample_count,
             mean_rssi_dbm, std_rssi_dbm, last_packet_elapsed_ns,
             predicted_state, p_absent, model_version, prediction_reason, predicted_at FROM windows
-            WHERE session_id=? ORDER BY window_index LIMIT 1000""",
+            WHERE session_id=? ORDER BY window_index DESC LIMIT 1000""",
             (str(session_id),)).fetchall()
-        return {"session_id": str(session_id), "windows": [dict(row) for row in rows]}
+        return {"session_id": str(session_id), "windows": [dict(row) for row in reversed(rows)]}
