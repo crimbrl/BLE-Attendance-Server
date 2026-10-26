@@ -20,6 +20,8 @@ import joblib
 import pandas as pd
 import sklearn
 
+from classroom_catalog import init_catalog, list_classrooms, get_classroom
+
 from features import FEATURES, build_feature_rows
 from attendance_rules import RULE_VERSION, PRESENT_STREAK, derive_events
 
@@ -205,6 +207,10 @@ def init_db():
         ):
             if name not in existing:
                 con.execute(f"ALTER TABLE windows ADD COLUMN {name} {sql_type}")
+        existing_classes = {row["name"] for row in con.execute("PRAGMA table_info(classes)")}
+        for name in ("classroom_id", "classroom_name", "beacon_name", "beacon_address"):
+            if name not in existing_classes:
+                con.execute(f"ALTER TABLE classes ADD COLUMN {name} TEXT")
         existing_sessions = {row["name"] for row in con.execute("PRAGMA table_info(sessions)")}
         for name in ("monitor_started_epoch_ms", "last_live_epoch_ms",
                      "monitor_until_epoch_ms", "last_live_window_index",
@@ -218,6 +224,7 @@ def init_db():
                 con.execute(f"ALTER TABLE sessions ADD COLUMN {name} {sql_type}")
 
 
+init_catalog()
 init_db()
 MODEL, MODEL_VERSION = load_prediction_model()
 
@@ -420,6 +427,7 @@ def expire_classes(now_ms=None):
 
 
 class ClassCreate(BaseModel):
+    classroom_id: str = Field(min_length=1, max_length=100)
     title: str = Field(min_length=1, max_length=100)
     duration_minutes: int = Field(default=90, ge=15, le=360)
 
@@ -429,14 +437,27 @@ def teacher_page():
     return FileResponse(Path(__file__).resolve().parent / 'teacher.html')
 
 
+@app.get("/v1/teacher/classrooms", dependencies=[Depends(require_teacher)])
+def classroom_list():
+    return {"classrooms": list_classrooms()}
+
+
 @app.post("/v1/teacher/classes", dependencies=[Depends(require_teacher)], status_code=201)
 def create_class(payload: ClassCreate):
     if not payload.title.strip():
         raise HTTPException(422, "수업 이름이 필요합니다")
+    try:
+        room = get_classroom(payload.classroom_id)
+    except ValueError as error:
+        raise HTTPException(422, str(error))
+    if room is None:
+        raise HTTPException(404, "등록되지 않은 강의실입니다")
     code = secrets.token_hex(4).upper()
     with database() as con:
-        con.execute("INSERT INTO classes(class_id,title,duration_minutes,created_epoch_ms) VALUES (?,?,?,?)",
-                    (code, payload.title.strip(), payload.duration_minutes, now_epoch_ms()))
+        con.execute("""INSERT INTO classes(class_id,title,duration_minutes,created_epoch_ms,
+                    classroom_id,classroom_name,beacon_name,beacon_address) VALUES (?,?,?,?,?,?,?,?)""",
+                    (code, payload.title.strip(), payload.duration_minutes, now_epoch_ms(),
+                     room['classroom_id'], room['classroom_name'], room['beacon_name'], room['beacon_address']))
     return {"class_id": code}
 
 
@@ -454,6 +475,8 @@ def start_class(class_id: str):
         row = con.execute("SELECT * FROM classes WHERE class_id=?", (class_id,)).fetchone()
         if not row: raise HTTPException(404, "수업을 찾을 수 없습니다")
         if row['status'] == 'ENDED': raise HTTPException(409, "새 수업을 생성하세요")
+        if not row['beacon_address']:
+            raise HTTPException(409, '강의실을 선택하여 새 수업을 생성하세요')
         if row['status'] == 'READY':
             now = now_epoch_ms()
             con.execute("UPDATE classes SET status='ACTIVE',started_epoch_ms=?,ends_epoch_ms=? WHERE class_id=?",
@@ -547,6 +570,10 @@ def create_session(payload: SessionStart):
         if payload.student_id is not None and lecture is None:
             raise HTTPException(404, "수업 코드를 확인하세요")
         if lecture is not None:
+            if not lecture['beacon_address']:
+                raise HTTPException(409, "강의실을 지정한 새 수업으로 참여하세요")
+            if payload.beacon_id.upper() != lecture['beacon_address']:
+                raise HTTPException(409, "수업에 지정된 비콘과 일치하지 않습니다")
             if not payload.student_id or not payload.student_id.strip() or not payload.student_name or not payload.student_name.strip():
                 raise HTTPException(422, "학생 ID와 이름이 필요합니다")
             if lecture['started_epoch_ms'] is None:
