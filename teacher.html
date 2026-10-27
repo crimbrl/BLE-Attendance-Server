@@ -22,6 +22,11 @@ let token='',selected='',busy=false;
 const stamp=t=>t?new Date(t).toLocaleTimeString('ko-KR',{hour12:false}):'—';
 function cell(tr,text){const td=document.createElement('td');td.textContent=text??'—';tr.append(td);return td}
 function badge(td,value){const span=document.createElement('span');span.className='badge '+value;span.textContent=labels[value]||value;td.append(span)}
+function alertStatus(a){
+if(a.status==='CLOSED')return a.close_reason==='CLASS_ENDED'?'수업 종료로 닫힘':a.close_reason==='SUPERSEDED'?'새 세션 참여로 닫힘':'관측 종료';
+if(a.status==='RESOLVED')return a.event_type==='NO_DATA'?(a.resolution_reason==='TRANSPORT_RECOVERED'?'데이터 전송 복구':'해제 (기존 기록)'):'학생 복귀 확인';
+return labels[a.status]||a.status;
+}
 async function api(path,method='GET',body){const r=await fetch(path,{method,headers:{'X-Teacher-Token':token,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});if(!r.ok){let e;try{e=await r.json()}catch{}throw Error(typeof e?.detail==='string'?e.detail:`요청 실패 (${r.status})`)}return r.json()}
 function fail(e){$('message').textContent=e.message;$('updated').textContent='연결 오류 · 마지막 표시값';}
 async function rooms(){const d=await api('/v1/teacher/classrooms');$('classroom').replaceChildren();for(const r of d.classrooms){const o=document.createElement('option');o.value=r.classroom_id;o.textContent=`${r.classroom_name} · ${r.beacon_name}`;$('classroom').append(o)}}
@@ -30,7 +35,7 @@ async function refresh(){if(!token||busy)return;busy=true;try{if(!selected){awai
 $('beacon').textContent=d.class.classroom_name?`강의실 ${d.class.classroom_name} · ${d.class.beacon_name} · ${d.class.beacon_address}`:'강의실 미지정 · 새 수업을 생성하세요';$('classTitle').textContent=d.class.title;$('classCode').textContent=id;$('classStatus').textContent=labels[d.class.status];$('schedule').textContent=d.class.status==='ENDED'?`종료 ${stamp(d.class.ended_epoch_ms)}`:`시작 ${stamp(d.class.started_epoch_ms)} · 종료 예정 ${stamp(d.class.ends_epoch_ms)}`;$('start').disabled=d.class.status!=='READY';$('end').disabled=d.class.status!=='ACTIVE';
 $('total').textContent=d.students.length;$('present').textContent=d.students.filter(x=>x.state==='PRESENT').length;$('attention').textContent=d.students.filter(x=>['LEFT','NO_DATA','INTERRUPTED','STALE','ABSENCE_CANDIDATE'].includes(x.state)).length;
 $('students').replaceChildren();for(const s of d.students){const tr=document.createElement('tr');cell(tr,`${s.student_name} (${s.student_id})`);badge(cell(tr,''),s.state);cell(tr,stamp(s.last_live_epoch_ms));cell(tr,s.window_count);const b=document.createElement('button');b.className='secondary';b.textContent='보기';b.onclick=()=>detail(s);cell(tr,'').append(b);$('students').append(tr)}$('emptyStudents').hidden=!!d.students.length;
-$('alerts').replaceChildren();for(const a of d.alerts){const tr=document.createElement('tr');cell(tr,stamp(a.event_time_epoch_ms));cell(tr,a.student_name||a.student_id||'기존 실험');badge(cell(tr,''),a.event_type);cell(tr,labels[a.status]||a.status);$('alerts').append(tr)}$('emptyAlerts').hidden=!!d.alerts.length;$('message').textContent='';$('updated').textContent=`갱신 ${stamp(d.server_epoch_ms)}`;
+$('alerts').replaceChildren();for(const a of d.alerts){const tr=document.createElement('tr');cell(tr,stamp(a.event_time_epoch_ms));cell(tr,a.student_name||a.student_id||'기존 실험');badge(cell(tr,''),a.event_type);cell(tr,alertStatus(a));$('alerts').append(tr)}$('emptyAlerts').hidden=!!d.alerts.length;$('message').textContent='';$('updated').textContent=`갱신 ${stamp(d.server_epoch_ms)}`;
 }catch(e){fail(e)}finally{busy=false}}
 async function detail(s){try{const d=await api(`/v1/collection-sessions/${s.session_id}/windows`);$('detailCard').hidden=false;$('detail').textContent=JSON.stringify({student:s,windows:d.windows?.slice(-12)},null,2)}catch(e){fail(e)}}
 $('login').onclick=async()=>{token=$('token').value.trim();try{await rooms();await list();$('auth').hidden=true;$('workspace').hidden=false;await refresh()}catch(e){token='';fail(e)}};

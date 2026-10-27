@@ -194,9 +194,15 @@ def init_db():
                 resolved_at_epoch_ms INTEGER,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
-            CREATE UNIQUE INDEX IF NOT EXISTS one_open_no_data_alert
-                ON no_data_alerts(session_id) WHERE resolved_at_epoch_ms IS NULL;
         """)
+        alert_columns = {row["name"] for row in con.execute("PRAGMA table_info(no_data_alerts)")}
+        for name, sql_type in (("closed_at_epoch_ms", "INTEGER"), ("close_reason", "TEXT"),
+                               ("resolution_reason", "TEXT")):
+            if name not in alert_columns:
+                con.execute(f"ALTER TABLE no_data_alerts ADD COLUMN {name} {sql_type}")
+        con.execute("DROP INDEX IF EXISTS one_open_no_data_alert")
+        con.execute("""CREATE UNIQUE INDEX one_open_no_data_alert ON no_data_alerts(session_id)
+            WHERE resolved_at_epoch_ms IS NULL AND closed_at_epoch_ms IS NULL""")
         existing = {row["name"] for row in con.execute("PRAGMA table_info(windows)")}
         for name, sql_type in (
             ("predicted_state", "TEXT"),
@@ -288,7 +294,7 @@ def refresh_attendance_events(con, session):
 
 
 def record_live_windows(con, session, accepted_indexes, received_ms):
-    """Only recent, newly accepted predictions advance server-observed liveness."""
+    """Only recent, newly accepted running windows prove transport recovery."""
     previous_index = session["last_live_window_index"]
     present_streak = session["fresh_present_streak"] or 0
     last_live_ms = session["last_live_epoch_ms"]
@@ -299,7 +305,7 @@ def record_live_windows(con, session, accepted_indexes, received_ms):
         row = con.execute("""SELECT scan_state, predicted_state FROM windows
             WHERE session_id=? AND beacon_id=? AND window_index=?""",
             (session["session_id"], session["beacon_id"], index)).fetchone()
-        if row["scan_state"] != "RUNNING" or row["predicted_state"] not in ("PRESENT", "ABSENT"):
+        if row["scan_state"] != "RUNNING":
             continue
         if previous_index is not None and index <= previous_index:
             continue
@@ -309,10 +315,10 @@ def record_live_windows(con, session, accepted_indexes, received_ms):
             present_streak = 0
         previous_index = index
         last_live_ms = received_ms
-        if present_streak >= PRESENT_STREAK:
-            con.execute("""UPDATE no_data_alerts SET resolved_at_epoch_ms=?
-                WHERE session_id=? AND resolved_at_epoch_ms IS NULL""",
-                (received_ms, session["session_id"]))
+        # Receiving data again does not prove that the student returned.
+        con.execute("""UPDATE no_data_alerts SET resolved_at_epoch_ms=?, resolution_reason='TRANSPORT_RECOVERED'
+            WHERE session_id=? AND resolved_at_epoch_ms IS NULL AND closed_at_epoch_ms IS NULL""",
+            (received_ms, session["session_id"]))
     con.execute("""UPDATE sessions SET last_live_epoch_ms=?, last_live_window_index=?,
         fresh_present_streak=? WHERE session_id=?""",
         (last_live_ms, previous_index, present_streak, session["session_id"]))
@@ -331,7 +337,7 @@ def check_no_data(now_ms=None):
             last_live = (session["last_live_epoch_ms"] if session["last_live_epoch_ms"] is not None
                          else session["monitor_started_epoch_ms"])
             if con.execute("""SELECT 1 FROM no_data_alerts WHERE session_id=?
-                AND resolved_at_epoch_ms IS NULL""", (session["session_id"],)).fetchone():
+                AND resolved_at_epoch_ms IS NULL AND closed_at_epoch_ms IS NULL""", (session["session_id"],)).fetchone():
                 continue
             latest_event = con.execute("""SELECT event_type FROM attendance_events
                 WHERE session_id=? AND beacon_id=? AND active=1
@@ -408,8 +414,9 @@ def close_session(con, session_id, when, reason):
     con.execute("""UPDATE sessions SET closed_epoch_ms=?, close_reason=?,
         monitor_until_epoch_ms=MIN(monitor_until_epoch_ms, ?) WHERE session_id=?
         AND closed_epoch_ms IS NULL""", (when, reason, when, session_id))
-    con.execute("""UPDATE no_data_alerts SET resolved_at_epoch_ms=?
-        WHERE session_id=? AND resolved_at_epoch_ms IS NULL""", (when, session_id))
+    con.execute("""UPDATE no_data_alerts SET closed_at_epoch_ms=?, close_reason=?
+        WHERE session_id=? AND resolved_at_epoch_ms IS NULL AND closed_at_epoch_ms IS NULL""",
+        (when, reason, session_id))
 
 
 def end_class(con, class_id, when):
@@ -518,7 +525,7 @@ def class_overview(class_id: str):
             latest = con.execute("SELECT * FROM windows WHERE session_id=? ORDER BY window_index DESC LIMIT 1", (session['session_id'],)).fetchone()
             rows = con.execute("SELECT * FROM windows WHERE session_id=? ORDER BY window_index", (session['session_id'],)).fetchall()
             events, candidate = derive_events(rows, include_candidate=True)
-            open_alert = con.execute("SELECT 1 FROM no_data_alerts WHERE session_id=? AND resolved_at_epoch_ms IS NULL", (session['session_id'],)).fetchone()
+            open_alert = con.execute("SELECT 1 FROM no_data_alerts WHERE session_id=? AND resolved_at_epoch_ms IS NULL AND closed_at_epoch_ms IS NULL", (session['session_id'],)).fetchone()
             state = 'INITIALIZING'
             if events and events[-1][1] == 'LEFT': state = 'LEFT'
             elif candidate is not None: state = 'ABSENCE_CANDIDATE'
@@ -541,6 +548,8 @@ def class_overview(class_id: str):
         alert['student_name'] = session['student_name'] if session else None
         if session and session['closed_epoch_ms'] and alert['status'] == 'OPEN':
             alert['status'] = 'CLOSED'
+            alert['closed_at_epoch_ms'] = session['closed_epoch_ms']
+            alert['close_reason'] = session['close_reason']
     return {"class": lecture, "students": students, "alerts": alerts, "server_epoch_ms": now}
 
 
@@ -691,7 +700,7 @@ def list_class_alerts(class_id: str):
             ORDER BY event_id DESC LIMIT 100""", (class_id,)).fetchall()
         alerts = []
         open_no_data = {row[0] for row in con.execute("""SELECT session_id FROM no_data_alerts
-            WHERE class_id=? AND resolved_at_epoch_ms IS NULL""", (class_id,))}
+            WHERE class_id=? AND resolved_at_epoch_ms IS NULL AND closed_at_epoch_ms IS NULL""", (class_id,))}
         for row in rows:
             event = dict(row)
             event["alert_key"] = f"ble:{event['event_id']}"
@@ -701,6 +710,13 @@ def list_class_alerts(class_id: str):
                 AND window_index>? LIMIT 1""",
                 (event["session_id"], event["window_index"])).fetchone()
             event["status"] = "RESOLVED" if event["event_type"] == "RETURNED" or returned else "OPEN"
+            if event["status"] == "OPEN":
+                closed_session = con.execute("""SELECT closed_epoch_ms, close_reason FROM sessions
+                    WHERE session_id=?""", (event["session_id"],)).fetchone()
+                if closed_session and closed_session["closed_epoch_ms"] is not None:
+                    event["status"] = "CLOSED"
+                    event["closed_at_epoch_ms"] = closed_session["closed_epoch_ms"]
+                    event["close_reason"] = closed_session["close_reason"]
             if (event["event_type"] == "LEFT" and event["status"] == "OPEN"
                     and event["session_id"] in open_no_data):
                 continue  # The same episode already has an open server-side alert.
@@ -708,14 +724,15 @@ def list_class_alerts(class_id: str):
         for row in con.execute("""SELECT alert_id AS event_id, session_id, beacon_id,
             missing_since_epoch_ms, suspected_since_epoch_ms, reason,
             triggered_at_epoch_ms AS event_time_epoch_ms,
-            resolved_at_epoch_ms, created_at FROM no_data_alerts
+            resolved_at_epoch_ms, closed_at_epoch_ms, close_reason, resolution_reason, created_at FROM no_data_alerts
             WHERE class_id=? ORDER BY alert_id DESC LIMIT 100""", (class_id,)):
             alert = dict(row)
             alert["alert_key"] = f"no_data:{alert['event_id']}"
             alert["event_type"] = "NO_DATA"
             alert["rule_version"] = "no-data-10m-v1"
             alert["source"] = "SERVER"
-            alert["status"] = "RESOLVED" if alert["resolved_at_epoch_ms"] is not None else "OPEN"
+            alert["status"] = ("CLOSED" if alert["closed_at_epoch_ms"] is not None else
+                               "RESOLVED" if alert["resolved_at_epoch_ms"] is not None else "OPEN")
             alerts.append(alert)
         alerts.sort(key=lambda row: row["event_time_epoch_ms"], reverse=True)
         return {"class_id": class_id, "alerts": alerts[:100]}
